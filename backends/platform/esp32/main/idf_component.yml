@@ -1,4 +1,10 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/esp32_p4_function_ev_board_noglib: "^4.1.0"
+  # Forked BSP: our TC358762 / RGB888 / ATTINY88 display bring-up lives in the vendored,
+  # git-tracked copy under bsp_override/ (managed_components is gitignored & auto-refetched).
+  espressif/esp32_p4_function_ev_board_noglib:
+    version: "^4.1.0"
+    override_path: "../bsp_override/esp32_p4_function_ev_board_noglib"
   usb_host_hid: "^1.0.1"
+  espressif/esp_lcd_touch_ft5x06: "^1.0.0"
+  espressif/esp_lcd_hx8399: "^2.0.2"
