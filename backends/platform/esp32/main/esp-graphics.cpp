@@ -31,6 +31,9 @@
 #include "gui/ThemeEngine.h"
 #include "esp-graphics.h"
 #include "bsp/esp-bsp.h"
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "esp_lcd_touch_ft5x06.h"
 #include "soc/mipi_dsi_bridge_struct.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -88,11 +91,19 @@ void EspGraphicsManager::gfxTask() {
 	while(1) {
 		int fbno=0;
 		if (xQueueReceive(_fb_num_q, (void*)(&fbno), portMAX_DELAY)) {
-			uint16_t *lcdbuf;
+			uint8_t *lcdbuf; //RGB888 framebuffer, 3 bytes/pixel
 			ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(_panel_handle, 1, (void**)&lcdbuf));
 			if (fbno==-1) {
-				//draw overlay
-				memcpy(lcdbuf, _overlay.getPixels(), SCREEN_WIDTH*SCREEN_HEIGHT*sizeof(uint16_t));
+				//draw overlay: convert RGB565 overlay → RGB888 framebuffer
+				uint16_t *ov=(uint16_t*)_overlay.getPixels();
+				uint8_t *d=lcdbuf;
+				for (int i=0; i<SCREEN_WIDTH*SCREEN_HEIGHT; i++) {
+					uint16_t p=ov[i];
+					//R/B swapped to match PPA path (RPi panel swaps red/blue in RGB888)
+					*d++=(p&0x1f)<<3;       //b
+					*d++=((p>>5)&0x3f)<<2;  //g
+					*d++=((p>>11)&0x1f)<<3; //r
+				}
 			} else {
 				//see if intermediate buffer needs resizing
 				if (_surf[fbno].w!=rgbfb_w || _surf[fbno].h!=rgbfb_h) {
@@ -106,6 +117,9 @@ void EspGraphicsManager::gfxTask() {
 					int r=_pal[fbno][i*3+0];
 					int g=_pal[fbno][i*3+1];
 					int b=_pal[fbno][i*3+2];
+					//Game path goes through PPA (RGB565→RGB888). PPA's 565→888 expansion already
+					//maps channels into the panel's B,G,R byte order, so NO manual R/B swap here —
+					//unlike the direct-write overlay/loading paths, which do swap.
 					pal16[i]=((r>>3)<<11)|((g>>2)<<5)|(b>>3);
 				}
 				//convert image
@@ -131,10 +145,10 @@ void EspGraphicsManager::gfxTask() {
 					},
 					.out={
 						.buffer=lcdbuf,
-						.buffer_size=SCREEN_WIDTH*SCREEN_HEIGHT*sizeof(int16_t),
+						.buffer_size=SCREEN_WIDTH*SCREEN_HEIGHT*3, //RGB888
 						.pic_w=SCREEN_WIDTH,
 						.pic_h=SCREEN_HEIGHT,
-						.srm_cm=PPA_SRM_COLOR_MODE_RGB565,
+						.srm_cm=PPA_SRM_COLOR_MODE_RGB888, //PPA converts RGB565 in → RGB888 out
 					},
 					.scale_x=(float)SCREEN_WIDTH/(float)rgbfb_w,
 					.scale_y=(float)SCREEN_HEIGHT/(float)rgbfb_h,
@@ -152,13 +166,20 @@ void EspGraphicsManager::gfxTask() {
 
 void EspGraphicsManager::init() {
 	//initialize LCD
-	bsp_display_new(NULL, &_panel_handle, &_io_handle);
-	esp_lcd_panel_disp_on_off(_panel_handle, true);
+	bsp_display_config_t disp_cfg = {
+		.hdmi_resolution = BSP_HDMI_RES_NONE,
+		.dsi_bus = {
+			.phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+			.lane_bit_rate_mbps = BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS,
+		},
+	};
+	ESP_ERROR_CHECK(bsp_display_new(&disp_cfg, &_panel_handle, &_io_handle));
+	esp_lcd_panel_disp_on_off(_panel_handle, true); // no-op / unsupported for raw DPI panels
 	bsp_display_brightness_init();
 	bsp_display_brightness_set(100);
 
-	//Show 'Loading...' image
-	uint16_t *lcdbuf;
+	//Show 'Loading...' image (RGB888 framebuffer, 3 bytes/pixel)
+	uint8_t *lcdbuf;
 	ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(_panel_handle, 1, (void**)&lcdbuf));
 	Image::PNGDecoder d;
 	Common::MemoryReadStream str=Common::MemoryReadStream(loading_png_start, loading_png_end-loading_png_start);
@@ -166,13 +187,16 @@ void EspGraphicsManager::init() {
 	const Graphics::Surface *s=d.getSurface();
 	uint8_t *p=(uint8_t*)s->getPixels();
 	for (int y=0; y<s->h; y++) {
-		uint16_t *q=&lcdbuf[SCREEN_WIDTH*((SCREEN_HEIGHT-s->h)/2+y)+(SCREEN_WIDTH-s->w)/2];
+		uint8_t *q=&lcdbuf[3*(SCREEN_WIDTH*((SCREEN_HEIGHT-s->h)/2+y)+(SCREEN_WIDTH-s->w)/2)];
 		for (int x=0; x<s->w; x++) {
 			int r=*p++;
 			int g=*p++;
 			int b=*p++;
 			p++;
-			*q++=((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+			//R/B swapped to match PPA path (RPi panel swaps red/blue in RGB888)
+			*q++=b;
+			*q++=g;
+			*q++=r;
 		}
 	}
 	ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(_panel_handle, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, lcdbuf));
@@ -183,7 +207,53 @@ void EspGraphicsManager::init() {
 	ESP_ERROR_CHECK(ppa_register_client(&ppa_cfg, &_ppa));
 
 	_overlay.create(SCREEN_WIDTH, SCREEN_HEIGHT, getOverlayFormat());
-	ESP_ERROR_CHECK(bsp_touch_new(NULL, &_touch_handle));
+
+	// I2C was already initialized by the BSP display init (TC358762 path calls bsp_i2c_init internally).
+	// Backlight and ATTINY88 are fully managed by the BSP TC358762 init sequence.
+
+	// Init FT5x06 touch at 0x38
+	{
+		esp_lcd_panel_io_handle_t touch_io = NULL;
+		esp_lcd_panel_io_i2c_config_t touch_io_cfg = {};
+		touch_io_cfg.dev_addr = 0x38;
+		touch_io_cfg.control_phase_bytes = 1;
+		touch_io_cfg.dc_bit_offset = 0;
+		touch_io_cfg.lcd_cmd_bits = 8;
+		touch_io_cfg.lcd_param_bits = 8;
+		touch_io_cfg.flags.disable_control_phase = 1;
+		touch_io_cfg.scl_speed_hz = 100000;
+		if (esp_lcd_new_panel_io_i2c(bsp_i2c_get_handle(), &touch_io_cfg, &touch_io) != ESP_OK) {
+			ESP_LOGW(TAG, "Touch IO init failed");
+			_touch_handle = NULL;
+		} else {
+			esp_lcd_touch_config_t touch_cfg = {
+				.x_max = SCREEN_WIDTH,
+				.y_max = SCREEN_HEIGHT,
+				.rst_gpio_num = GPIO_NUM_NC,
+				.int_gpio_num = GPIO_NUM_NC,
+				.levels = { .reset = 0, .interrupt = 0 },
+				.flags = { .swap_xy = 0, .mirror_x = 1, .mirror_y = 1 },
+			};
+			if (esp_lcd_touch_new_i2c_ft5x06(touch_io, &touch_cfg, &_touch_handle) != ESP_OK) {
+				ESP_LOGW(TAG, "Touch controller FT5x06 init failed, touch input disabled");
+				_touch_handle = NULL;
+			} else {
+				ESP_LOGI(TAG, "FT5x06 touch initialized");
+			}
+		}
+	}
+
+	// Scan I2C bus to identify connected devices (I2C is initialized by bsp_touch_new)
+	{
+		i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+		ESP_LOGI(TAG, "I2C bus scan:");
+		for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+			if (i2c_master_probe(i2c_bus, addr, 10) == ESP_OK) {
+				ESP_LOGI(TAG, "  Found device at 0x%02x", addr);
+			}
+		}
+		ESP_LOGI(TAG, "I2C scan done");
+	}
 
 	_cur_fb=0;
 	_fb_num_q=xQueueCreate(1, sizeof(int));
@@ -321,13 +391,20 @@ int16 EspGraphicsManager::getOverlayWidth() const {
 }
 
 void EspGraphicsManager::clearOverlay() {
-	//kinda icky but should work
-	uint16_t *lcdbuf;
+	//kinda icky but should work: snapshot the RGB888 framebuffer into the RGB565 overlay
+	uint8_t *lcdbuf;
 	ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(_panel_handle, 1, (void**)&lcdbuf));
-	memcpy(_overlay.getPixels(), lcdbuf, SCREEN_WIDTH*SCREEN_HEIGHT*sizeof(uint16_t));
+	uint16_t *ov=(uint16_t*)_overlay.getPixels();
+	uint8_t *src=lcdbuf;
+	for (int i=0; i<SCREEN_WIDTH*SCREEN_HEIGHT; i++) {
+		//framebuffer byte order is B,G,R (R/B swapped for the RPi panel)
+		int b=*src++, g=*src++, r=*src++;
+		ov[i]=((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+	}
 }
 
 int EspGraphicsManager::getTouch(Common::Point &pos) {
+	if (!_touch_handle) return 0;
 	uint16_t x[3], y[3], strength[3];
 	uint8_t num=0;
 	esp_lcd_touch_read_data(_touch_handle);
