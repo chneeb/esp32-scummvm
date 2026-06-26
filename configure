@@ -3628,7 +3628,7 @@ if test -n "$_host"; then
 			_ogg=yes
 			OGG_CFLAGS="-Ibackends/platform/esp32/managed_components/georgik__ogg/ogg/"
 			_png=yes
-			PNG_CFLAGS="-Ibackends/platform/esp32/managed_components/espressif__libpng/libpng"
+			PNG_CFLAGS="-Ibackends/platform/esp32/managed_components/espressif__libpng/libpng -Ibackends/platform/esp32/managed_components/espressif__libpng"
 			_vorbis=no
 			_port_mk="backends/platform/esp32/esp32.mk"
 			_seq_midi=no
