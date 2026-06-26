@@ -52,6 +52,7 @@
 #include "usb_hid.h"
 #include "hid_keys.h"
 #include "mmc.h"
+#include "driver/i2c_master.h"
 
 class OSystem_esp32 : public ModularMixerBackend, public ModularGraphicsBackend, Common::EventSource {
 public:
@@ -84,12 +85,22 @@ private:
 	bool _mousedown_queued;
 	Common::Point _last_mouse_pos;
 	int64_t _last_ts_time_us;
+	// M5Stack CardKB I2C keyboard (addr 0x5F on the Qwiic/I2C bus)
+	i2c_master_dev_handle_t _cardkb;
+	int64_t _last_kbd_time_us;
+	bool _kbd_down;
+	Common::KeyCode _kbd_keycode;
+	uint16 _kbd_ascii;
+	byte _kbd_flags;
 };
 
 OSystem_esp32::OSystem_esp32(bool silenceLogs) :
 	_silenceLogs(silenceLogs) {
 	_fsFactory = new POSIXESPFilesystemFactory();
 	_last_ts_time_us = 0;
+	_cardkb = NULL;
+	_last_kbd_time_us = 0;
+	_kbd_down = false;
 }
 
 OSystem_esp32::~OSystem_esp32() {
@@ -105,6 +116,21 @@ void OSystem_esp32::initBackend() {
 	EspGraphicsManager *gfx = new EspGraphicsManager();
 	_graphicsManager = gfx;
 	gfx->init();
+
+	// M5Stack CardKB I2C keyboard on the Qwiic/I2C bus. gfx->init() brought up the I2C bus.
+	{
+		i2c_device_config_t kbcfg = {};
+		kbcfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+		kbcfg.device_address = 0x5F;
+		kbcfg.scl_speed_hz = 100000;
+		if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &kbcfg, &_cardkb) != ESP_OK) {
+			ESP_LOGW(TAG, "CardKB: failed to add I2C device at 0x5F, keyboard disabled");
+			_cardkb = NULL;
+		} else {
+			ESP_LOGI(TAG, "CardKB: I2C keyboard initialized at 0x5F");
+		}
+	}
+
 	_mixerManager = new EspMixerManager(44100, 2048);
 	_mixerManager->init();
 
@@ -208,6 +234,49 @@ static int keymap[][3] = {
 };
 
 
+// Map an M5Stack CardKB byte to a ScummVM key, per the CardKB firmware key_map:
+// printable keys send their ASCII (shift/sym layers included), enter/tab/backspace/esc
+// send control codes, arrows send 180-183, and the Fn layer sends 128-175.
+static void cardkb_map(uint8_t b, Common::KeyCode &kc, uint16 &ascii, byte &flags) {
+	flags = 0;
+	ascii = 0;
+	switch (b) {
+	case 0x0d: kc = Common::KEYCODE_RETURN;    ascii = Common::ASCII_RETURN;  return;
+	case 0x08: kc = Common::KEYCODE_BACKSPACE; ascii = 8;                     return;
+	case 0x09: kc = Common::KEYCODE_TAB;       ascii = 9;                     return;
+	case 0x1b: kc = Common::KEYCODE_ESCAPE;    ascii = Common::ASCII_ESCAPE;  return;
+	case 0x7f: kc = Common::KEYCODE_DELETE;                                   return; // shift+del
+	// arrows (CardKB normal layer)
+	case 180: kc = Common::KEYCODE_LEFT;  return;
+	case 181: kc = Common::KEYCODE_UP;    return;
+	case 182: kc = Common::KEYCODE_DOWN;  return;
+	case 183: kc = Common::KEYCODE_RIGHT; return;
+	// Fn layer: Fn+1..Fn+0 -> F1..F10, Fn+del -> F11, Fn+tab -> F12 (e.g. F5=Fn+5 saves)
+	case 129: kc = Common::KEYCODE_F1;  ascii = Common::ASCII_F1;  return;
+	case 130: kc = Common::KEYCODE_F2;  ascii = Common::ASCII_F2;  return;
+	case 131: kc = Common::KEYCODE_F3;  ascii = Common::ASCII_F3;  return;
+	case 132: kc = Common::KEYCODE_F4;  ascii = Common::ASCII_F4;  return;
+	case 133: kc = Common::KEYCODE_F5;  ascii = Common::ASCII_F5;  return;
+	case 134: kc = Common::KEYCODE_F6;  ascii = Common::ASCII_F6;  return;
+	case 135: kc = Common::KEYCODE_F7;  ascii = Common::ASCII_F7;  return;
+	case 136: kc = Common::KEYCODE_F8;  ascii = Common::ASCII_F8;  return;
+	case 137: kc = Common::KEYCODE_F9;  ascii = Common::ASCII_F9;  return;
+	case 138: kc = Common::KEYCODE_F10; ascii = Common::ASCII_F10; return;
+	case 139: kc = Common::KEYCODE_F11; ascii = Common::ASCII_F11; return;
+	case 140: kc = Common::KEYCODE_F12; ascii = Common::ASCII_F12; return;
+	default: break;
+	}
+	if (b >= 0x20 && b <= 0x7e) {
+		ascii = b;
+		if (b >= 'A' && b <= 'Z') { kc = (Common::KeyCode)(b - 'A' + 'a'); flags = Common::KBD_SHIFT; }
+		else                        kc = (Common::KeyCode)b; // a-z, 0-9, symbols, space
+		return;
+	}
+	// unmapped (other Fn combos) — ignore rather than inject a high-ASCII char
+	kc = Common::KEYCODE_INVALID;
+	ascii = 0;
+}
+
 bool OSystem_esp32::pollEvent(Common::Event &event) {
 	((DefaultTimerManager *)getTimerManager())->checkTimers();
 
@@ -238,6 +307,31 @@ bool OSystem_esp32::pollEvent(Common::Event &event) {
 		}
 		_was_touched=touched;
 		if (event.type!=Common::EVENT_INVALID) return true;
+	}
+
+	// M5Stack CardKB (I2C @ 0x5F): one byte = pressed key's ASCII, 0 = nothing pressed.
+	// Emit a KEYDOWN on press edge and a KEYUP when the key is released.
+	if (_cardkb && (esp_timer_get_time()-_last_kbd_time_us) > (1000000/60)) {
+		_last_kbd_time_us=esp_timer_get_time();
+		uint8_t b=0;
+		if (i2c_master_receive(_cardkb, &b, 1, pdMS_TO_TICKS(10))==ESP_OK) {
+			if (b!=0 && !_kbd_down) {
+				cardkb_map(b, _kbd_keycode, _kbd_ascii, _kbd_flags);
+				event.type=Common::EVENT_KEYDOWN;
+				event.kbd.keycode=_kbd_keycode;
+				event.kbd.ascii=_kbd_ascii;
+				event.kbd.flags=_kbd_flags;
+				_kbd_down=true;
+				return true;
+			} else if (b==0 && _kbd_down) {
+				event.type=Common::EVENT_KEYUP;
+				event.kbd.keycode=_kbd_keycode;
+				event.kbd.ascii=_kbd_ascii;
+				event.kbd.flags=_kbd_flags;
+				_kbd_down=false;
+				return true;
+			}
+		}
 	}
 
 	hid_ev_t ev;
