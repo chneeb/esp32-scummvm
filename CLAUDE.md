@@ -8,7 +8,7 @@ A fork of [ScummVM](https://github.com/scummvm/scummvm) targeting the **ESP32-P4
 
 **Actual hardware in use:** a **Waveshare ESP32-P4 Module Basic Kit** (ESP32-P4-Module-DEV-KIT), built against Espressif's `esp32_p4_function_ev_board` BSP. The boards are not identical — notably the Waveshare baseboard routes USB through a mux + onboard hub (see "USB keyboard" below), which the Espressif BSP does not handle.
 
-The board is configured for a **5" 800×480 MIPI DSI display** (RPi 7" V1-style clone, connected via the 22-pin Pi-style FPC cable that came with the display), NOT the native 1024×600 EK79007 panel. The panel is driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** power/control MCU (I2C 0x45, firmware 0xC3); touch IC is FT5x06 at I2C 0x38. ScummVM boots and runs fully — display, touch, SD card, and audio all work (see "Display" below). **A USB HID keyboard does NOT work on this board** (ESP-IDF limitation behind the onboard hub — see "USB keyboard" below); the on-screen keyboard is the working text-input path.
+The board is configured for a **5" 800×480 MIPI DSI display** (RPi 7" V1-style clone, connected via the 22-pin Pi-style FPC cable that came with the display), NOT the native 1024×600 EK79007 panel. The panel is driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** power/control MCU (I2C 0x45, firmware 0xC3); touch IC is FT5x06 at I2C 0x38. ScummVM boots and runs fully — display, touch, SD card, and audio all work (see "Display" below). Keyboard input is via an **M5Stack CardKB I2C keyboard** on the Qwiic/I2C port (see "Keyboard" below); a **USB HID keyboard does NOT work on this board** (ESP-IDF limitation behind the onboard hub).
 
 ## Build system overview
 
@@ -96,7 +96,7 @@ This is expected and harmless. The `espressif/usb` external component is only ne
 
 ## Display (working)
 
-The display, touch, audio, and SD all work (USB keyboard does not — see "USB keyboard"). The panel is an **RPi 7" V1-style 800×480 DSI** driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** MCU (I2C 0x45, fw 0xC3), touch **FT5x06** at I2C 0x38. It is NOT an ILI9881C/HX8399 panel — those vendor-init paths were tried and stayed dark; only the TC358762 bridge path produces an image.
+The display, touch, audio, and SD all work (keyboard is via I2C CardKB — see "Keyboard"). The panel is an **RPi 7" V1-style 800×480 DSI** driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** MCU (I2C 0x45, fw 0xC3), touch **FT5x06** at I2C 0x38. It is NOT an ILI9881C/HX8399 panel — those vendor-init paths were tried and stayed dark; only the TC358762 bridge path produces an image.
 
 ### Reference driver
 
@@ -118,15 +118,25 @@ Ported from `github.com/embenix/ESP32-P4-DSI-Support-Hub` → `main/lcd_config/r
 - **No need to `rm` the managed-component `.obj` before building** — ninja tracks edits correctly (verify with `ninja -n` in `build/`). The old "build cache bug" was a misdiagnosed stale flash.
 - **Power-cycle is only needed to recover from a bad/dark build** that wedged the bridge's PLL (the RTS reset doesn't power-cycle the display, which draws power from its own connector). A good build flashes + RTS-resets fine without unplugging. Could be hardened in `tc358762_power_on` (longer reset hold / true power-down) if it ever gets annoying.
 
-## USB keyboard (does NOT work on the Waveshare board)
+## Keyboard
 
-The USB HID code is fully compiled, linked, and started (`usb_hid_task()` task in `app_main`, `main/usb_hid.c`); the host stack comes up fine (`Waiting for HID Device to be connected` in the log). The problem is the **Waveshare board's USB topology** vs **ESP-IDF limitations**:
+**Working: M5Stack CardKB I2C keyboard** (plugged into the board's Qwiic/I2C port). Implemented in `OSystem_esp32::pollEvent` / `cardkb_map` (`main/main.cpp`): the device is at I2C **0x5F** and returns a single byte = the pressed key's code (`0` = nothing). It's polled at ~60 Hz on the shared I2C bus (`bsp_i2c_get_handle()`) and edge-detected into KEYDOWN/KEYUP pairs (the CardKB only reports the current key, not press/release). Mapping (per the CardKB firmware `key_map`):
+- printable keys, Shift (uppercase/symbols) and Sym layers → their ASCII directly
+- enter=13, backspace=8, tab=9, esc=27, shift+del=0x7F→Delete
+- arrows: Left=180, Up=181, Down=182, Right=183
+- **Fn layer (bytes 128–175): `Fn+1..Fn+0 → F1..F10`, `Fn+del → F11`, `Fn+tab → F12`** — so **F5 (save) = Fn+5**, **F7 (load) = Fn+7**.
 
-- The board routes the ESP32-P4 **high-speed** USB through an **FSUSB42 mux** to either an onboard **CH334F 4-port hub** or a direct connector (J8), selected by hardware (`USB_SEL` via R37 + the **H3 header/jumper** — *not* a GPIO, so firmware can't switch it). Set the H3 jumper for the hub path to make the hub enumerate.
-- The Type-C port labelled **"USB" is the ESP32-P4 full-speed OTG** (GPIO24/25), a *different* controller. ESP-IDF only supports the **HS/UTMI host** on P4 (`usb_host.c`: "We support HS+UTMI only ATM."), so that port can't be a host.
-- With the hub enumerating, a keyboard is rejected: `HUB: Connected device is LS, transaction translator (TT) is not supported`. ESP-IDF v5.5 has **not implemented the USB hub Transaction Translator** (`ext_hub.c`: "Transaction Translator has not been implemented yet"), so **Low/Full-Speed devices (any normal keyboard/mouse) behind the High-Speed hub cannot be used.**
+Also available: the **on-screen keyboard** (two-finger tap) as a touch-only fallback.
 
-Net: with current ESP-IDF, a USB keyboard works only if wired **directly to the HS root port** (no hub) — i.e. the mux's non-hub path to a usable connector. The 4 hub ports and the FS "USB" port are both dead ends. Workarounds: use the **on-screen keyboard** (two-finger tap; README's documented text-input path), or a future ESP-IDF with TT support. A temporary `ESP_LOGI("USB HID event: ...")` trace is currently in `OSystem_esp32::pollEvent` (`main/main.cpp`) for diagnosing this — remove it once done.
+### USB keyboard does NOT work on this board
+
+The USB HID code is fully compiled, linked and started (`usb_hid_task()` in `app_main`, `main/usb_hid.c`; host stack logs `Waiting for HID Device to be connected`). It's blocked by the **Waveshare USB topology + ESP-IDF limits**, not by our code:
+
+- The board routes the ESP32-P4 **high-speed** USB through an **FSUSB42 mux** to either an onboard **CH334F 4-port hub** or a direct connector (J8), selected in hardware (`USB_SEL` via R37 + the **H3 header/jumper** — *not* a GPIO, so firmware can't switch it).
+- The Type-C port labelled **"USB" is the ESP32-P4 full-speed OTG** (GPIO24/25), a different controller; ESP-IDF only supports the **HS/UTMI host** on P4 (`usb_host.c`: "We support HS+UTMI only ATM.").
+- Even with the hub enumerating, a keyboard is rejected: `HUB: Connected device is LS, transaction translator (TT) is not supported` — ESP-IDF v5.5 has **not implemented the hub Transaction Translator** (`ext_hub.c`), so Low/Full-Speed devices behind the HS hub can't be used.
+
+Net: a USB keyboard would only work wired directly to the HS root port (no hub); the hub ports and the FS "USB" port are dead ends. The CardKB above is the practical keyboard, so this is parked.
 
 ## Note: forked BSP under `bsp_override/` (managed_components is gitignored)
 
