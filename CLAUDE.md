@@ -8,7 +8,7 @@ A fork of [ScummVM](https://github.com/scummvm/scummvm) targeting the **ESP32-P4
 
 **Actual hardware in use:** a **Waveshare ESP32-P4 Module Basic Kit** (ESP32-P4-Module-DEV-KIT), built against Espressif's `esp32_p4_function_ev_board` BSP. The boards are not identical — notably the Waveshare baseboard routes USB through a mux + onboard hub (see "USB keyboard" below), which the Espressif BSP does not handle.
 
-The board is configured for a **5" 800×480 MIPI DSI display** (RPi 7" V1-style clone, connected via the 22-pin Pi-style FPC cable that came with the display), NOT the native 1024×600 EK79007 panel. The panel is driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** power/control MCU (I2C 0x45, firmware 0xC3); touch IC is FT5x06 at I2C 0x38. ScummVM boots and runs fully — display, touch, SD card, and audio all work (see "Display" below). Keyboard input is via an **M5Stack CardKB I2C keyboard** on the Qwiic/I2C port (see "Keyboard" below); a **USB HID keyboard does NOT work on this board** (ESP-IDF limitation behind the onboard hub).
+The board is configured for a **5" 800×480 MIPI DSI display** (RPi 7" V1-style clone, connected via the 22-pin Pi-style FPC cable that came with the display), NOT the native 1024×600 EK79007 panel. The panel is driven by a **TC358762 DSI-to-DPI bridge** + **ATTINY88** power/control MCU (I2C 0x45, firmware 0xC3); touch IC is FT5x06 at I2C 0x38. ScummVM boots and runs fully — display, touch, SD card, and audio all work (see "Display" below). Keyboard input works three ways (see "Keyboard" below): a **USB keyboard** on the HS **root port** (the lower J8 USB-A port, next to the Ethernet jack — the onboard hub ports do *not* work, an ESP-IDF limitation), an optional **M5Stack CardKB I2C keyboard** on the Qwiic/I2C port (auto-detected), and the touch **on-screen keyboard**.
 
 ## Build system overview
 
@@ -120,23 +120,31 @@ Ported from `github.com/embenix/ESP32-P4-DSI-Support-Hub` → `main/lcd_config/r
 
 ## Keyboard
 
-**Working: M5Stack CardKB I2C keyboard** (plugged into the board's Qwiic/I2C port). Implemented in `OSystem_esp32::pollEvent` / `cardkb_map` (`main/main.cpp`): the device is at I2C **0x5F** and returns a single byte = the pressed key's code (`0` = nothing). It's polled at ~60 Hz on the shared I2C bus (`bsp_i2c_get_handle()`) and edge-detected into KEYDOWN/KEYUP pairs (the CardKB only reports the current key, not press/release). Mapping (per the CardKB firmware `key_map`):
+Three keyboard inputs work; use whichever is plugged in:
+
+1. **USB keyboard** — works when plugged into the **HS root port** (see "Which USB port" below).
+2. **M5Stack CardKB I2C keyboard** — optional, auto-detected on the Qwiic/I2C bus.
+3. **On-screen keyboard** (two-finger tap) — touch-only fallback, always available.
+
+### USB keyboard (works on the root port only)
+
+USB HID keyboard support (`usb_hid_task()` in `app_main`, `main/usb_hid.c`, on the `espressif__usb_host_hid` stack) **works** — but *only* on the ESP32-P4 high-speed root port, not behind the board's onboard hub.
+
+- **Which USB port:** on the Waveshare baseboard, **J8 is a stacked pair of USB-A ports**. Plug the keyboard into the **lower port (closest to the PCB, next to the Ethernet/RJ45 jack)** — that one is the HS root. Both tested keyboards worked there. The **upper J8 port and the FS "USB" Type-C are dead ends** for a keyboard.
+- **Why the other ports fail:** the board routes the P4 **high-speed** USB through an **FSUSB42 mux** (`USB_SEL` via R37 + the **H3 header/jumper** — hardware, not a GPIO) to either the **CH334F 4-port hub** or a direct root connector. A LS/FS keyboard **behind the HS hub** is rejected: `HUB: Connected device is LS, transaction translator (TT) is not supported` — the USB Host stack has **not implemented the hub Transaction Translator** (`ext_hub.c`: `"Transaction Translator has not been implemented yet"`, `TODO: IDF-10059`). The Type-C labelled **"USB"** is the P4 **full-speed OTG** (GPIO24/25), a different controller ESP-IDF can't host from (`usb_host.c`: "We support HS+UTMI only ATM."). On the **root port there is no hub, so no TT is needed** — hence it works.
+- **Diagnosing a port:** in `idf.py monitor`, a hub-side port logs the `TT is not supported` line; the root port instead proceeds to enumerate the HID device with no TT line.
+
+**TT is still unimplemented as of IDF 6.0 (checked 2026-07)**, so you *cannot* make the hub ports work by upgrading IDF. In IDF 6.0 the USB Host stack was removed from the IDF tree (`components/usb/` no longer exists at tag `v6.0.2`) and moved into the standalone **`espressif/usb`** managed component (repo `espressif/esp-usb`, path `host/usb/`), versioned independently of IDF. The latest component (v1.4.1 + `[Unreleased]`, min IDF `>=5.5.3`) still carries the same `"Transaction Translator has not been implemented yet"` in `host/usb/src/ext_hub.c` and the same `TT is not supported` reject in `host/usb/src/hub.c` (guarded by `parent_speed == USB_SPEED_HIGH`, so **root-port** LS/FS devices are fine — only *behind-a-HS-hub* is blocked). Implementing TT would span the vendored component (`ext_hub.c` + `hcd_dwc.c`) **and** IDF's in-tree DWC HAL (which has no HCSPLT accessor) — a major effort. The root port sidesteps all of it.
+
+### M5Stack CardKB I2C keyboard (optional, auto-detected)
+
+Plugged into the board's Qwiic/I2C port at I2C **0x5F**. `initBackend()` **probes 0x5F first** (`i2c_master_probe`) and only enables the CardKB if it ACKs — if none is connected it's skipped silently (logs `CardKB: no I2C keyboard at 0x5F, skipping`), so `pollEvent` never issues reads to a missing device (which would NACK and spam the log). USB keyboards are unaffected either way.
+
+Implemented in `OSystem_esp32::pollEvent` / `cardkb_map` (`main/main.cpp`): the device returns a single byte = the pressed key's code (`0` = nothing), polled at ~60 Hz on the shared I2C bus (`bsp_i2c_get_handle()`) and edge-detected into KEYDOWN/KEYUP pairs (the CardKB only reports the current key, not press/release). Mapping (per the CardKB firmware `key_map`):
 - printable keys, Shift (uppercase/symbols) and Sym layers → their ASCII directly
 - enter=13, backspace=8, tab=9, esc=27, shift+del=0x7F→Delete
 - arrows: Left=180, Up=181, Down=182, Right=183
 - **Fn layer (bytes 128–175): `Fn+1..Fn+0 → F1..F10`, `Fn+del → F11`, `Fn+tab → F12`** — so **F5 (save) = Fn+5**, **F7 (load) = Fn+7**.
-
-Also available: the **on-screen keyboard** (two-finger tap) as a touch-only fallback.
-
-### USB keyboard does NOT work on this board
-
-The USB HID code is fully compiled, linked and started (`usb_hid_task()` in `app_main`, `main/usb_hid.c`; host stack logs `Waiting for HID Device to be connected`). It's blocked by the **Waveshare USB topology + ESP-IDF limits**, not by our code:
-
-- The board routes the ESP32-P4 **high-speed** USB through an **FSUSB42 mux** to either an onboard **CH334F 4-port hub** or a direct connector (J8), selected in hardware (`USB_SEL` via R37 + the **H3 header/jumper** — *not* a GPIO, so firmware can't switch it).
-- The Type-C port labelled **"USB" is the ESP32-P4 full-speed OTG** (GPIO24/25), a different controller; ESP-IDF only supports the **HS/UTMI host** on P4 (`usb_host.c`: "We support HS+UTMI only ATM.").
-- Even with the hub enumerating, a keyboard is rejected: `HUB: Connected device is LS, transaction translator (TT) is not supported` — ESP-IDF v5.5 has **not implemented the hub Transaction Translator** (`ext_hub.c`), so Low/Full-Speed devices behind the HS hub can't be used.
-
-Net: a USB keyboard would only work wired directly to the HS root port (no hub); the hub ports and the FS "USB" port are dead ends. The CardKB above is the practical keyboard, so this is parked.
 
 ## Note: forked BSP under `bsp_override/` (managed_components is gitignored)
 

@@ -118,7 +118,13 @@ void OSystem_esp32::initBackend() {
 	gfx->init();
 
 	// M5Stack CardKB I2C keyboard on the Qwiic/I2C bus. gfx->init() brought up the I2C bus.
-	{
+	// Probe first: if no CardKB is plugged in, skip it entirely so pollEvent never issues
+	// I2C reads to a missing device (which would NACK and spam the log). USB keyboards are
+	// unaffected — this only gates the optional I2C keyboard.
+	if (i2c_master_probe(bsp_i2c_get_handle(), 0x5F, pdMS_TO_TICKS(50)) != ESP_OK) {
+		ESP_LOGI(TAG, "CardKB: no I2C keyboard at 0x5F, skipping (USB keyboard still available)");
+		_cardkb = NULL;
+	} else {
 		i2c_device_config_t kbcfg = {};
 		kbcfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
 		kbcfg.device_address = 0x5F;
